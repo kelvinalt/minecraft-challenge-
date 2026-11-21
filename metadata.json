@@ -1,0 +1,6 @@
+{
+  "name": "BlockCraft — Voxel Sandbox",
+  "description": "Browser-based 3D voxel sandbox game with procedural terrain, survival & creative modes, inventory crafting, and Minecraft-inspired HUD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
