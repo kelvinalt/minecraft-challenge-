@@ -15,10 +15,14 @@ interface GameHUDProps {
 }
 
 const PixelHeart: React.FC<{ state: 'full' | 'half' | 'empty' }> = ({ state }) => (
-  <svg width="16" height="16" viewBox="0 0 9 9" className="pixelated shrink-0">
+  <svg width="18" height="18" viewBox="0 0 9 9" className="pixelated shrink-0">
     <path
       d="M1 1h2v1h1v1h1V2h1V1h2v1h1v3H8v1H7v1H6v1H5v1H4V8H3V7H2V6H1V5H0V2h1V1z"
-      fill="#141414"
+      fill="#101010"
+    />
+    <path
+      d="M1 2h2v1h1v1h1V3h1V2h2v3H7v1H6v1H5v1H4V7H3V6H2V5H1V2z"
+      fill="#2a2a2a"
     />
     {state !== 'empty' && (
       <path
@@ -27,19 +31,20 @@ const PixelHeart: React.FC<{ state: 'full' | 'half' | 'empty' }> = ({ state }) =
             ? 'M1 2h2v1h1v1h1V3h1V2h2v3H7v1H6v1H5v1H4V7H3V6H2V5H1V2z'
             : 'M1 2h2v1h1v1h0V7H3V6H2V5H1V2z'
         }
-        fill="#e02828"
+        fill="#ff1313"
       />
     )}
-    {state !== 'empty' && <rect x="2" y="3" width="1" height="1" fill="#ff9c9c" />}
+    {state !== 'empty' && <rect x="2" y="3" width="1" height="1" fill="#ffc4c4" />}
   </svg>
 );
 
 const PixelHunger: React.FC<{ state: 'full' | 'half' | 'empty' }> = ({ state }) => (
-  <svg width="16" height="16" viewBox="0 0 9 9" className="pixelated shrink-0">
+  <svg width="18" height="18" viewBox="0 0 9 9" className="pixelated shrink-0">
     <path
       d="M4 0h3v1h1v3H7v1H5v1H4v1H2v1H1V7h1V5h1V4h1V1h0V0z"
-      fill="#141414"
+      fill="#101010"
     />
+    <path d="M4 1h3v3H6v1H4v1H3V5h1V1z" fill="#2a2a2a" />
     {state !== 'empty' && (
       <path
         d={
@@ -47,11 +52,11 @@ const PixelHunger: React.FC<{ state: 'full' | 'half' | 'empty' }> = ({ state }) 
             ? 'M4 1h3v3H6v1H4v1H3V5h1V1z'
             : 'M4 1h1v4H4v1H3V5h1V1z'
         }
-        fill="#b86b2b"
+        fill="#a35a24"
       />
     )}
-    <rect x="1" y="6" width="2" height="2" fill="#e5d7b8" />
-    {state !== 'empty' && <rect x="5" y="2" width="1" height="1" fill="#e09452" />}
+    <rect x="1" y="6" width="2" height="2" fill="#e8dcc0" />
+    {state !== 'empty' && <rect x="5" y="2" width="1" height="1" fill="#db8b48" />}
   </svg>
 );
 
@@ -72,6 +77,8 @@ export const GameHUD: React.FC<GameHUDProps> = ({
     setSelectedHotbarSlot,
     health,
     hunger,
+    xp,
+    lastHurtAt,
     telemetry,
     targetHit,
     miningProgress,
@@ -79,8 +86,16 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   } = useGame();
 
   const [itemToast, setItemToast] = useState<string | null>(null);
+  const [hurtFlash, setHurtFlash] = useState(false);
   const selectedSlot = inventory[selectedHotbarSlot];
   const selectedDef = selectedSlot ? getItemDef(selectedSlot.itemId) : undefined;
+
+  useEffect(() => {
+    if (!lastHurtAt) return;
+    setHurtFlash(true);
+    const t = window.setTimeout(() => setHurtFlash(false), 260);
+    return () => window.clearTimeout(t);
+  }, [lastHurtAt]);
 
   useEffect(() => {
     if (!selectedDef) {
@@ -94,70 +109,78 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 
   const targetDef = targetHit ? getItemDef(targetHit.blockId) : undefined;
   const isSurvival = activeWorld?.gameMode === 'survival';
+  const xpLevel = Math.floor(xp / 10);
+  const xpPct = (xp % 10) * 10;
 
   return (
     <div className="fixed inset-0 z-20 pointer-events-none select-none flex flex-col justify-between">
+      {/* Survival Hurt Vignette */}
+      {hurtFlash && (
+        <div
+          className="fixed inset-0 z-10 pointer-events-none transition-opacity duration-200"
+          style={{
+            boxShadow: 'inset 0 0 90px rgba(220, 20, 20, 0.72)',
+            backgroundColor: 'rgba(180, 15, 15, 0.14)',
+          }}
+        />
+      )}
+
       {/* WebGL Context Lost Banner */}
       {webglLost && (
         <div className="absolute inset-0 z-50 bg-black/85 flex items-center justify-center p-6 pointer-events-auto">
           <div className="mc-dark-panel p-6 max-w-sm text-center space-y-3">
-            <h3 className="font-pixel text-lg text-amber-300">Graphics Context Lost</h3>
+            <h3 className="font-pixel text-lg text-[#ffff55]">Graphics Context Lost</h3>
             <p className="text-sm text-stone-300 font-ui">
-              Your browser paused WebGL rendering. Reload or wait for restoration.
+              WebGL rendering was paused by the browser. Waiting for context restore.
             </p>
           </div>
         </div>
       )}
 
-      {/* Top Row: Left Debug/Game Info + Center Target/Pointer Prompt + Right Quick Buttons */}
-      <div className="flex items-start justify-between p-3 gap-4">
-        {/* Game Information Display (F3) */}
+      {/* Top Row: Classic F3 Debug Lines + Target Hint + Quick Buttons */}
+      <div className="flex items-start justify-between p-2.5 gap-4">
         {settings.showDebugHud ? (
-          <div className="bg-black/60 border border-white/15 px-3 py-2 text-[11px] leading-relaxed font-mono-tabular text-white space-y-0.5 max-w-xs">
-            <div className="font-pixel text-xs text-[#ffff55]">
-              {activeWorld?.name ?? 'World'} ·{' '}
-              <span className="capitalize">{activeWorld?.gameMode ?? 'survival'}</span>
+          <div
+            className="font-mono-tabular text-[12px] leading-[1.35] text-white space-y-0.5 max-w-sm"
+            style={{ textShadow: '1px 1px 0 #1c1c1c' }}
+          >
+            <div className="bg-black/50 px-1.5 inline-block">
+              Minecraft 1.21 ({telemetry.fps} fps)
             </div>
-            <div>
+            <br />
+            <div className="bg-black/50 px-1.5 inline-block">
               XYZ: {telemetry.position[0]} / {telemetry.position[1]} / {telemetry.position[2]}
             </div>
-            <div>
-              Chunk: {telemetry.chunk[0]}, {telemetry.chunk[1]} ({telemetry.loadedChunks} active)
+            <br />
+            <div className="bg-black/50 px-1.5 inline-block">
+              Chunk: {telemetry.chunk[0]}, {telemetry.chunk[1]} ({telemetry.loadedChunks} loaded)
             </div>
-            <div>
-              Facing: {telemetry.facing} ({telemetry.yawDeg}°)
+            <br />
+            <div className="bg-black/50 px-1.5 inline-block">
+              Facing: {telemetry.facing} ({telemetry.yawDeg}° / {telemetry.pitchDeg}°)
             </div>
-            <div>
-              Biome: <span className="text-emerald-300">{telemetry.biome}</span> · Day{' '}
-              {telemetry.dayCount} ({telemetry.timeOfDayLabel})
-            </div>
-            <div>
-              FPS: {telemetry.fps}
-              {telemetry.isFlying ? ' · Flying' : ''}
-              {telemetry.isSubmerged ? ' · Underwater' : ''}
+            <br />
+            <div className="bg-black/50 px-1.5 inline-block">
+              Dim: {telemetry.dimension === 'nether' ? 'The Nether' : telemetry.dimension === 'end' ? 'The End' : 'Overworld'} · Biome: {telemetry.biome} · Day {telemetry.dayCount} ({telemetry.timeOfDayLabel})
             </div>
           </div>
         ) : (
           <div />
         )}
 
-        {/* Top-Center: Target Block Indicator + Click-to-Lock hint */}
+        {/* Top-Center: Target Block & Click-to-Lock Banner */}
         <div className="flex flex-col items-center gap-1.5">
           {targetDef && targetHit && (
-            <div className="bg-black/70 border border-white/20 px-3 py-1.5 flex items-center gap-2.5">
-              <ItemIcon itemId={targetHit.blockId} size={22} />
-              <div className="text-left">
-                <div className="font-pixel text-xs text-white leading-tight">
-                  {targetDef.name}
-                </div>
-                <div className="font-mono-tabular text-[10px] text-stone-300">
-                  [{targetHit.blockPos.join(', ')}]
-                  {targetHit.blockId === BlockId.CraftingTable
-                    ? ' · Right-Click to Craft'
-                    : targetDef.preferredTool
-                    ? ` · Best: ${targetDef.preferredTool}`
-                    : ''}
-                </div>
+            <div className="bg-black/65 border border-black px-3 py-1 flex items-center gap-2">
+              <ItemIcon itemId={targetHit.blockId} size={20} />
+              <div className="font-pixel text-xs text-white" style={{ textShadow: '1px 1px 0 #111' }}>
+                {targetDef.name}
+                {targetHit.blockId === BlockId.CraftingTable || targetHit.blockId === BlockId.Furnace
+                  ? ' (Right-Click)'
+                  : ''}
+                {targetHit.blockId === BlockId.NetherPortal || targetHit.blockId === BlockId.EndPortal
+                  ? ' (Right-Click to Travel)'
+                  : ''}
               </div>
             </div>
           )}
@@ -166,48 +189,48 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             <button
               type="button"
               onClick={onRequestLock}
-              className="pointer-events-auto bg-black/75 hover:bg-black/90 border border-amber-300/40 px-3 py-1 text-xs font-ui text-amber-200 transition-colors cursor-pointer"
+              className="pointer-events-auto bg-black/75 hover:bg-black/90 border border-[#ffffa0]/45 px-3 py-1 text-xs font-ui text-[#ffffa0] cursor-pointer"
             >
-              Click viewport to lock mouse look (or drag to look)
+              Click world to lock cursor (or drag to look)
             </button>
           )}
         </div>
 
-        {/* Top-Right: Quick Action Buttons (mouse/touch accessible) */}
-        <div className="flex items-center gap-2 pointer-events-auto">
+        {/* Top-Right Quick Menu Buttons */}
+        <div className="flex items-center gap-1.5 pointer-events-auto">
           <button
             type="button"
             onClick={onOpenInventory}
-            className="mc-btn px-3 py-1.5 text-xs whitespace-nowrap"
+            className="mc-btn px-2.5 py-1 text-[11px] whitespace-nowrap"
           >
-            Bag (E)
+            Inv (E)
           </button>
           <button
             type="button"
             onClick={onPause}
-            className="mc-btn px-3 py-1.5 text-xs whitespace-nowrap"
+            className="mc-btn px-2.5 py-1 text-[11px] whitespace-nowrap"
           >
             Menu (Esc)
           </button>
         </div>
       </div>
 
-      {/* Center Crosshair + Mining Progress */}
+      {/* Authentic Inverted Pixel Crosshair */}
       <div className="fixed inset-0 flex items-center justify-center pointer-events-none">
         <div className="relative flex flex-col items-center">
           <svg
-            width="22"
-            height="22"
-            viewBox="0 0 22 22"
-            className="drop-shadow-[0_1px_2px_rgba(0,0,0,0.85)]"
+            width="18"
+            height="18"
+            viewBox="0 0 18 18"
+            className="mix-blend-difference"
           >
-            <rect x="10" y="3" width="2" height="16" fill="#ffffff" fillOpacity="0.92" />
-            <rect x="3" y="10" width="16" height="2" fill="#ffffff" fillOpacity="0.92" />
+            <rect x="8" y="2" width="2" height="14" fill="#ffffff" />
+            <rect x="2" y="8" width="14" height="2" fill="#ffffff" />
           </svg>
           {miningProgress > 0 && (
-            <div className="mt-3 w-14 h-1.5 bg-black/75 border border-white/30">
+            <div className="mt-3 w-14 h-1.5 bg-black/80 border border-black">
               <div
-                className="h-full bg-[#a3ff7a]"
+                className="h-full bg-[#80ff20]"
                 style={{ width: `${Math.round(miningProgress * 100)}%` }}
               />
             </div>
@@ -215,9 +238,8 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         </div>
       </div>
 
-      {/* Bottom HUD: Touch Controls (optional) + Health/Hunger + 9-Slot Hotbar */}
-      <div className="relative pb-3 px-4 flex flex-col items-center">
-        {/* Optional On-Screen Touch Controls */}
+      {/* Bottom Classic Minecraft HUD */}
+      <div className="relative pb-2.5 px-4 flex flex-col items-center">
         {settings.touchControls && (
           <div className="w-full flex items-end justify-between mb-3 pointer-events-auto">
             <div className="grid grid-cols-3 gap-1.5 w-36">
@@ -287,59 +309,80 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           </div>
         )}
 
-        {/* Selected Item Name Toast */}
-        <div className="h-6 mb-1 flex items-center justify-center">
+        {/* Selected Item Name Above Hotbar */}
+        <div className="h-5 mb-1 flex items-center justify-center">
           {itemToast && (
-            <span className="font-pixel text-xs text-white bg-black/65 px-2.5 py-0.5 border border-white/15">
+            <span
+              className="font-pixel text-xs text-white"
+              style={{ textShadow: '2px 2px 0 #1a1a1a' }}
+            >
               {itemToast}
             </span>
           )}
         </div>
 
-        {/* Status Bars (Survival: Health + Hunger + Oxygen; Creative: Creative badge text) */}
-        <div className="w-full max-w-[468px] flex items-center justify-between mb-1.5 px-0.5">
+        {/* Health + Hunger + XP Bar */}
+        <div className="w-full max-w-[424px] mb-1.5 space-y-1">
           {isSurvival ? (
             <>
-              {/* 10 Hearts */}
-              <div className="flex items-center gap-0.5" aria-label={`Health ${health} of 20`}>
-                {Array.from({ length: 10 }).map((_, idx) => {
-                  const val = health - idx * 2;
-                  const state = val >= 2 ? 'full' : val === 1 ? 'half' : 'empty';
-                  return <PixelHeart key={idx} state={state} />;
-                })}
-              </div>
-
-              {/* Right side: Oxygen (if underwater) + 10 Hunger Drumsticks */}
-              <div className="flex flex-col items-end gap-1">
-                {telemetry.isSubmerged && (
-                  <div className="flex items-center gap-1" aria-label="Underwater">
-                    {Array.from({ length: 10 }).map((_, i) => (
-                      <span
-                        key={i}
-                        className="w-2.5 h-2.5 border border-[#143d6b] bg-[#52b6ff] inline-block"
-                      />
-                    ))}
-                  </div>
-                )}
-                <div className="flex items-center gap-0.5" aria-label={`Hunger ${hunger} of 20`}>
+              <div className="flex items-end justify-between">
+                {/* 10 Hearts */}
+                <div className="flex items-center gap-[1px]" aria-label={`Health ${health} of 20`}>
                   {Array.from({ length: 10 }).map((_, idx) => {
-                    const val = hunger - (9 - idx) * 2;
+                    const val = health - idx * 2;
                     const state = val >= 2 ? 'full' : val === 1 ? 'half' : 'empty';
-                    return <PixelHunger key={idx} state={state} />;
+                    return <PixelHeart key={idx} state={state} />;
                   })}
                 </div>
+
+                {/* Oxygen + 10 Hunger Drumsticks */}
+                <div className="flex flex-col items-end gap-0.5">
+                  {telemetry.isSubmerged && (
+                    <div className="flex items-center gap-1" aria-label="Underwater">
+                      {Array.from({ length: 10 }).map((_, i) => (
+                        <span
+                          key={i}
+                          className="w-2.5 h-2.5 border border-[#0f345e] bg-[#4cb8ff] inline-block"
+                        />
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-[1px]" aria-label={`Hunger ${hunger} of 20`}>
+                    {Array.from({ length: 10 }).map((_, idx) => {
+                      const val = hunger - (9 - idx) * 2;
+                      const state = val >= 2 ? 'full' : val === 1 ? 'half' : 'empty';
+                      return <PixelHunger key={idx} state={state} />;
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Classic Segmented Green Experience Bar */}
+              <div className="relative w-full h-1.5 bg-[#1a1a1a] border border-black">
+                <div className="h-full bg-[#80ff20] transition-all duration-200" style={{ width: `${xpPct}%` }} />
+                {xpLevel > 0 && (
+                  <span
+                    className="absolute -top-3.5 left-1/2 -translate-x-1/2 font-pixel text-[11px] text-[#80ff20]"
+                    style={{ textShadow: '1px 1px 0 #000, -1px -1px 0 #000' }}
+                  >
+                    {xpLevel}
+                  </span>
+                )}
               </div>
             </>
           ) : (
-            <div className="w-full flex items-center justify-between text-[11px] font-pixel text-amber-200 bg-black/50 px-2 py-0.5 border border-white/15">
+            <div
+              className="flex items-center justify-between text-[11px] font-pixel text-[#ffffa0]"
+              style={{ textShadow: '1px 1px 0 #111' }}
+            >
               <span>Creative Mode</span>
-              <span>{telemetry.isFlying ? 'Flying (F)' : 'Double-Space or F to Fly'}</span>
+              <span>{telemetry.isFlying ? 'Flying' : 'Double-Space / F to Fly'}</span>
             </div>
           )}
         </div>
 
-        {/* 9-Slot Hotbar */}
-        <div className="mc-hotbar-frame p-1 flex items-center gap-1 pointer-events-auto">
+        {/* Classic 9-Slot Minecraft Hotbar */}
+        <div className="mc-hotbar-bar p-1 flex items-center gap-1 pointer-events-auto">
           {Array.from({ length: 9 }).map((_, idx) => {
             const slot = inventory[idx];
             const isActive = selectedHotbarSlot === idx;
@@ -355,24 +398,23 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                 type="button"
                 onClick={() => setSelectedHotbarSlot(idx)}
                 title={def?.name ?? `Slot ${idx + 1}`}
-                className={`relative w-11 h-11 sm:w-12 sm:h-12 flex items-center justify-center cursor-pointer ${
-                  isActive ? 'mc-slot-active z-10' : 'mc-slot'
+                className={`relative w-10 h-10 sm:w-11 sm:h-11 flex items-center justify-center cursor-pointer ${
+                  isActive ? 'mc-hotbar-slot-active' : 'mc-hotbar-slot'
                 }`}
               >
-                <span className="absolute top-0.5 left-1 font-mono-tabular text-[9px] text-white/60 leading-none">
-                  {idx + 1}
-                </span>
-
                 {slot && <ItemIcon itemId={slot.itemId} size={30} />}
 
                 {slot && slot.count > 1 && (
-                  <span className="absolute bottom-0.5 right-1 font-pixel text-[11px] text-white drop-shadow-[1px_1px_0_#000] leading-none">
+                  <span
+                    className="absolute bottom-0 right-0.5 font-pixel text-[11px] text-white leading-none"
+                    style={{ textShadow: '1px 1px 0 #1f1f1f' }}
+                  >
                     {slot.count}
                   </span>
                 )}
 
                 {durRatio !== null && durRatio < 1 && (
-                  <div className="absolute bottom-1 left-1.5 right-1.5 h-1 bg-[#1a1a1a]">
+                  <div className="absolute bottom-0.5 left-1 right-1 h-1 bg-[#141414]">
                     <div
                       className="h-full"
                       style={{
@@ -388,10 +430,12 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           })}
         </div>
 
-        {/* Compact Controls Hint */}
         {settings.showControlsHint && (
-          <div className="mt-1.5 text-[11px] font-ui text-white/80 bg-black/50 px-3 py-0.5 border border-white/10 hidden sm:block">
-            WASD Move · Space Jump · L-Click Break · R-Click Place/Use · 1-9 Hotbar · E Inventory · F3 Info
+          <div
+            className="mt-1.5 text-[11px] font-ui text-white/85 hidden sm:block"
+            style={{ textShadow: '1px 1px 0 #111' }}
+          >
+            WASD Move · Space Jump · L-Click Mine · R-Click Place/Eat · 1-9 Hotbar · E Inventory · F3 Debug
           </div>
         )}
       </div>

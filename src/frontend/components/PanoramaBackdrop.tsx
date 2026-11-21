@@ -91,6 +91,16 @@ export const PanoramaBackdrop: React.FC = () => {
       depthWrite: false,
       side: THREE.DoubleSide,
     });
+    const emissiveMat = new THREE.MeshStandardMaterial({
+      map: atlas,
+      emissive: new THREE.Color(0xffffff),
+      emissiveMap: atlas,
+      emissiveIntensity: 0.9,
+      vertexColors: true,
+      transparent: true,
+      alphaTest: 0.2,
+      side: THREE.DoubleSide,
+    });
 
     const meshes: THREE.Mesh[] = [];
     for (let cx = -1; cx <= 1; cx++) {
@@ -108,6 +118,11 @@ export const PanoramaBackdrop: React.FC = () => {
         }
         if (res.water) {
           const m = new THREE.Mesh(res.water, waterMat);
+          scene.add(m);
+          meshes.push(m);
+        }
+        if (res.emissive) {
+          const m = new THREE.Mesh(res.emissive, emissiveMat);
           scene.add(m);
           meshes.push(m);
         }
@@ -182,6 +197,7 @@ export const PanoramaBackdrop: React.FC = () => {
       opaqueMat.dispose();
       cutoutMat.dispose();
       waterMat.dispose();
+      emissiveMat.dispose();
       atlas.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {

@@ -6,12 +6,13 @@ import {
   DebugTelemetry,
   GameMode,
   GameSettings,
+  MobEntityDto,
   RaycastHit,
 } from '../../shared/types';
 import { getItemDef, isBlockSolid } from '../../shared/blocks';
-import { CHUNK_HEIGHT, CHUNK_SIZE, IWorldProvider, WATER_LEVEL } from '../../shared/worldInterface';
+import { CHUNK_HEIGHT, CHUNK_SIZE, IWorldProvider } from '../../shared/worldInterface';
 import { buildChunkGeometry } from './ChunkMesher';
-import { createAtlasTexture } from './TextureAtlas';
+import { ATLAS_GRID, createAtlasTexture, getBlockFaceTiles, getItemIconUrl } from './TextureAtlas';
 import { soundFX } from './SoundFX';
 
 // Reusable module-level math objects (Zero GC inside render loop)
@@ -21,8 +22,11 @@ const _vRayOrigin = new THREE.Vector3();
 const _vRayDir = new THREE.Vector3();
 const _vSkyColor = new THREE.Color();
 const _vDaySky = new THREE.Color(0x7fb4ff);
-const _vSunsetSky = new THREE.Color(0xe68c5c);
-const _vNightSky = new THREE.Color(0x0c1324);
+const _vDawnSky = new THREE.Color(0xefa06e);
+const _vSunsetSky = new THREE.Color(0xe37652);
+const _vNightSky = new THREE.Color(0x0b1224);
+const _vNetherFog = new THREE.Color(0x3a1010);
+const _vEndFog = new THREE.Color(0x130b24);
 
 export interface VoxelEngineCallbacks {
   onTelemetry: (telemetry: DebugTelemetry) => void;
@@ -30,7 +34,8 @@ export interface VoxelEngineCallbacks {
   onMiningProgress: (progress: number) => void; // 0 to 1
   onBreakBlock: (pos: [number, number, number], blockId: BlockId) => void;
   onPlaceBlock: (pos: [number, number, number], normal: [number, number, number]) => void;
-  onInteractBlock: (pos: [number, number, number], blockId: BlockId) => boolean; // true if handled (e.g. Crafting Table)
+  onInteractBlock: (pos: [number, number, number], blockId: BlockId) => boolean;
+  onHitMob?: (mobId: number) => void;
   onSelectHotbarIndex: (index: number) => void;
   onPauseRequest: () => void;
   onToggleInventory: () => void;
@@ -45,12 +50,23 @@ interface ChunkMeshGroup {
   opaqueMesh?: THREE.Mesh;
   waterMesh?: THREE.Mesh;
   cutoutMesh?: THREE.Mesh;
+  emissiveMesh?: THREE.Mesh;
 }
 
 interface BreakParticle {
   mesh: THREE.Mesh;
   vel: THREE.Vector3;
   life: number;
+}
+
+interface MobVisual {
+  group: THREE.Group;
+  limbs: THREE.Mesh[];
+  materials: THREE.MeshStandardMaterial[];
+  dto: MobEntityDto;
+  targetPos: THREE.Vector3;
+  targetYaw: number;
+  hurtTimer: number;
 }
 
 export class VoxelEngine {
@@ -70,9 +86,23 @@ export class VoxelEngine {
   private opaqueMaterial!: THREE.MeshStandardMaterial;
   private cutoutMaterial!: THREE.MeshStandardMaterial;
   private waterMaterial!: THREE.MeshStandardMaterial;
+  private emissiveMaterial!: THREE.MeshStandardMaterial;
+
+  // Light Shader Uniforms
+  private shaderUniforms = {
+    uTime: { value: 0 },
+    uDaylight: { value: 1 },
+    uDim: { value: 0 }, // 0=overworld, 1=nether, 2=end
+    uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+  };
+
+  private skyDome!: THREE.Mesh;
+  private skyDomeMat!: THREE.ShaderMaterial;
 
   private chunkMeshes = new Map<string, ChunkMeshGroup>();
   private worldGroup = new THREE.Group();
+  private mobGroup = new THREE.Group();
+  private mobVisuals = new Map<number, MobVisual>();
   private cloudGroup = new THREE.Group();
   private sunMesh!: THREE.Mesh;
   private moonMesh!: THREE.Mesh;
@@ -90,6 +120,8 @@ export class VoxelEngine {
   private handPivot = new THREE.Group();
   private handCube!: THREE.Mesh;
   private handArm!: THREE.Mesh;
+  private handItemSprite!: THREE.Mesh;
+  private handItemTextures = new Map<number, THREE.Texture>();
   private swingProgress = 0;
   private isSwinging = false;
 
@@ -100,16 +132,17 @@ export class VoxelEngine {
   // Player state
   public playerPos = new THREE.Vector3(0.5, 25, 0.5);
   public velocity = new THREE.Vector3(0, 0, 0);
-  public yaw = 0; // radians
+  public yaw = 0;
   public pitch = -0.15;
   private isGrounded = false;
   private isFlying = false;
   private isSubmerged = false;
+  private lavaBurnTimer = 0;
   private lastSpaceTap = 0;
   private fallStartY: number | null = null;
   private stepDist = 0;
   private bobPhase = 0;
-  public timeOfDay = 0.28; // 0..1 (0.25 morning, 0.5 noon, 0.75 dusk, 0.0 midnight)
+  public timeOfDay = 0.28; // 0=midnight, 0.25=dawn, 0.5=noon, 0.75=sunset
   private dayCount = 1;
 
   // Input state
@@ -149,6 +182,9 @@ export class VoxelEngine {
     this.gameMode = gameMode;
     this.settings = { ...settings };
     this.callbacks = callbacks;
+
+    this.shaderUniforms.uDim.value =
+      world.dimension === 'nether' ? 1 : world.dimension === 'end' ? 2 : 0;
 
     this.initRenderer();
     this.initScene();
@@ -210,6 +246,86 @@ export class VoxelEngine {
     this.callbacks.onWebGLContextLost(false);
   };
 
+  private initSkyDome() {
+    const skyGeo = new THREE.SphereGeometry(220, 32, 20);
+    this.skyDomeMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      uniforms: {
+        uTime: this.shaderUniforms.uTime,
+        uDaylight: this.shaderUniforms.uDaylight,
+        uDim: this.shaderUniforms.uDim,
+        uSunDir: this.shaderUniforms.uSunDir,
+        uHorizonColor: { value: new THREE.Color(0xa6d2ff) },
+        uZenithColor: { value: new THREE.Color(0x4b8cf5) },
+      },
+      vertexShader: `
+        varying vec3 vDir;
+        void main() {
+          vDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform float uTime;
+        uniform float uDaylight;
+        uniform float uDim;
+        uniform vec3 uSunDir;
+        uniform vec3 uHorizonColor;
+        uniform vec3 uZenithColor;
+        varying vec3 vDir;
+
+        float hash31(vec3 p) {
+          p = fract(p * 0.1031);
+          p += dot(p, p.yzx + 33.33);
+          return fract((p.x + p.y) * p.z);
+        }
+
+        void main() {
+          vec3 dir = normalize(vDir);
+          float h = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+          vec3 sky = mix(uHorizonColor, uZenithColor, pow(clamp(dir.y, 0.0, 1.0), 0.55));
+
+          if (uDim < 0.5) {
+            // Sun halo scatter
+            float sunDot = max(0.0, dot(dir, normalize(uSunDir)));
+            float sunGlow = pow(sunDot, 12.0) * 0.38 + pow(sunDot, 72.0) * 0.45;
+            vec3 glowCol = mix(vec3(1.0, 0.55, 0.25), vec3(1.0, 0.96, 0.82), uDaylight);
+            sky += glowCol * sunGlow * clamp(uSunDir.y + 0.3, 0.0, 1.0);
+
+            // Twinkling stars at dusk / night
+            float nightAmt = 1.0 - smoothstep(0.0, 0.45, uDaylight);
+            if (nightAmt > 0.01 && dir.y > 0.02) {
+              vec3 starCell = floor(dir * 190.0);
+              float rnd = hash31(starCell);
+              if (rnd > 0.992) {
+                float twinkle = 0.55 + 0.45 * sin(uTime * 3.0 + rnd * 120.0);
+                sky += vec3(0.88, 0.93, 1.0) * nightAmt * twinkle * smoothstep(0.02, 0.22, dir.y);
+              }
+            }
+          } else if (uDim > 1.5) {
+            // The End cosmic star void
+            vec3 starCell = floor(dir * 160.0);
+            float rnd = hash31(starCell);
+            if (rnd > 0.991) {
+              float twinkle = 0.5 + 0.5 * sin(uTime * 2.2 + rnd * 90.0);
+              sky += vec3(0.75, 0.62, 1.0) * twinkle;
+            }
+          } else {
+            // Nether volcanic cavern glow band
+            float ember = exp(-abs(dir.y) * 5.0) * (0.25 + 0.06 * sin(uTime * 2.0 + dir.x * 6.0));
+            sky += vec3(0.65, 0.14, 0.04) * ember;
+          }
+
+          gl_FragColor = vec4(sky, 1.0);
+        }
+      `,
+    });
+    this.skyDome = new THREE.Mesh(skyGeo, this.skyDomeMat);
+    this.scene.add(this.skyDome);
+  }
+
   private initScene() {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x7fb4ff);
@@ -217,13 +333,14 @@ export class VoxelEngine {
 
     const width = this.container.clientWidth || window.innerWidth;
     const height = this.container.clientHeight || window.innerHeight;
-    this.camera = new THREE.PerspectiveCamera(this.settings.fov, width / height, 0.08, 320);
+    this.camera = new THREE.PerspectiveCamera(this.settings.fov, width / height, 0.08, 340);
 
-    // Studio environment reflection for subtle PBR crispness
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     this.scene.environmentIntensity = 0.35;
     pmrem.dispose();
+
+    this.initSkyDome();
 
     // Warm sun directional + cool hemisphere fill
     this.hemiLight = new THREE.HemisphereLight(0xd9ecff, 0x4b5545, 0.85);
@@ -245,18 +362,22 @@ export class VoxelEngine {
     this.scene.add(this.keyLight);
     this.scene.add(this.keyLight.target);
 
-    // Celestial Sun & Moon
+    // Celestial Sun & Moon (Overworld)
     this.sunMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(10, 10, 10),
-      new THREE.MeshBasicMaterial({ color: 0xffe484, fog: false })
+      new THREE.BoxGeometry(11, 11, 11),
+      new THREE.MeshBasicMaterial({ color: 0xffe994, fog: false })
     );
     this.scene.add(this.sunMesh);
 
     this.moonMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(8, 8, 8),
+      new THREE.BoxGeometry(8.5, 8.5, 8.5),
       new THREE.MeshBasicMaterial({ color: 0xdbe6ff, fog: false })
     );
     this.scene.add(this.moonMesh);
+
+    const isOverworld = this.world.dimension === 'overworld';
+    this.sunMesh.visible = isOverworld;
+    this.moonMesh.visible = isOverworld;
 
     // Procedural blocky clouds
     const cloudGeo = new THREE.BoxGeometry(14, 1.8, 9);
@@ -271,41 +392,129 @@ export class VoxelEngine {
       c.scale.set(0.7 + (i % 4) * 0.3, 1, 0.8 + (i % 3) * 0.35);
       this.cloudGroup.add(c);
     }
+    this.cloudGroup.visible = isOverworld;
     this.scene.add(this.cloudGroup);
 
-    // Block atlas materials
+    // Block atlas + light-shader enhanced PBR materials
     this.atlasTexture = createAtlasTexture();
     this.atlasTexture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
+
+    const attachAtmosphereShader = (mat: THREE.MeshStandardMaterial, key: string) => {
+      mat.customProgramCacheKey = () => key;
+      mat.onBeforeCompile = (shader) => {
+        shader.uniforms.uDaylight = this.shaderUniforms.uDaylight;
+        shader.uniforms.uDim = this.shaderUniforms.uDim;
+        shader.fragmentShader = shader.fragmentShader
+          .replace(
+            '#include <common>',
+            `#include <common>
+            uniform float uDaylight;
+            uniform float uDim;`
+          )
+          .replace(
+            '#include <dithering_fragment>',
+            `vec3 nightTint = vec3(0.74, 0.84, 1.10);
+            vec3 dayTint = vec3(1.03, 1.01, 0.98);
+            vec3 dimTint = uDim > 1.5
+              ? vec3(0.94, 0.86, 1.08)
+              : (uDim > 0.5 ? vec3(1.14, 0.86, 0.80) : mix(nightTint, dayTint, uDaylight));
+            gl_FragColor.rgb *= dimTint;
+            #include <dithering_fragment>`
+          );
+      };
+    };
 
     this.opaqueMaterial = new THREE.MeshStandardMaterial({
       map: this.atlasTexture,
       vertexColors: true,
-      roughness: 0.88,
+      roughness: 0.86,
       metalness: 0.04,
     });
+    attachAtmosphereShader(this.opaqueMaterial, 'voxel-opaque-light');
 
     this.cutoutMaterial = new THREE.MeshStandardMaterial({
       map: this.atlasTexture,
       vertexColors: true,
-      roughness: 0.85,
+      roughness: 0.84,
       metalness: 0.02,
       transparent: true,
       alphaTest: 0.2,
       side: THREE.DoubleSide,
     });
+    attachAtmosphereShader(this.cutoutMaterial, 'voxel-cutout-light');
 
     this.waterMaterial = new THREE.MeshStandardMaterial({
       map: this.atlasTexture,
       vertexColors: true,
-      roughness: 0.15,
-      metalness: 0.1,
+      roughness: 0.14,
+      metalness: 0.12,
       transparent: true,
-      opacity: 0.72,
+      opacity: 0.74,
       depthWrite: false,
       side: THREE.DoubleSide,
     });
+    this.waterMaterial.customProgramCacheKey = () => 'voxel-water-wave';
+    this.waterMaterial.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.shaderUniforms.uTime;
+      shader.uniforms.uDaylight = this.shaderUniforms.uDaylight;
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+          uniform float uTime;
+          varying float vWave;`
+        )
+        .replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+          float w = sin(position.x * 1.9 + uTime * 2.4) * cos(position.z * 1.9 + uTime * 1.9) * 0.045;
+          transformed.y += w;
+          vWave = w;`
+        );
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+          uniform float uDaylight;
+          varying float vWave;`
+        )
+        .replace(
+          '#include <dithering_fragment>',
+          `gl_FragColor.rgb += vec3(0.06, 0.11, 0.16) * (vWave * 10.0 + 0.4) * (0.35 + 0.65 * uDaylight);
+          #include <dithering_fragment>`
+        );
+    };
+
+    this.emissiveMaterial = new THREE.MeshStandardMaterial({
+      map: this.atlasTexture,
+      emissive: new THREE.Color(0xffffff),
+      emissiveMap: this.atlasTexture,
+      emissiveIntensity: 0.92,
+      vertexColors: true,
+      roughness: 0.55,
+      transparent: true,
+      alphaTest: 0.2,
+      side: THREE.DoubleSide,
+    });
+    this.emissiveMaterial.customProgramCacheKey = () => 'voxel-emissive-pulse';
+    this.emissiveMaterial.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.shaderUniforms.uTime;
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+          uniform float uTime;`
+        )
+        .replace(
+          '#include <emissivemap_fragment>',
+          `#include <emissivemap_fragment>
+          float pulse = 0.88 + 0.14 * sin(uTime * 3.2);
+          totalEmissiveRadiance *= pulse;`
+        );
+    };
 
     this.scene.add(this.worldGroup);
+    this.scene.add(this.mobGroup);
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
@@ -323,26 +532,38 @@ export class VoxelEngine {
     this.handScene.add(light);
     this.handScene.add(new THREE.AmbientLight(0xffffff, 0.7));
 
-    // Bare arm
     const armGeo = new THREE.BoxGeometry(0.24, 0.65, 0.24);
     const armMat = new THREE.MeshStandardMaterial({ color: 0xc99374, roughness: 0.85 });
     this.handArm = new THREE.Mesh(armGeo, armMat);
     this.handArm.position.set(0.55, -0.52, -0.78);
     this.handArm.rotation.set(0.55, -0.35, 0.22);
 
-    // Held block miniature
     const cubeGeo = new THREE.BoxGeometry(0.32, 0.32, 0.32);
     const cubeMat = new THREE.MeshStandardMaterial({
-      color: 0x67a93f,
-      roughness: 0.85,
+      map: this.atlasTexture,
+      roughness: 0.88,
+      transparent: true,
+      alphaTest: 0.2,
     });
     this.handCube = new THREE.Mesh(cubeGeo, cubeMat);
     this.handCube.position.set(0.52, -0.36, -0.76);
     this.handCube.rotation.set(0.18, -0.65, 0.08);
     this.handCube.visible = false;
 
+    const itemGeo = new THREE.PlaneGeometry(0.42, 0.42);
+    const itemMat = new THREE.MeshBasicMaterial({
+      transparent: true,
+      alphaTest: 0.2,
+      side: THREE.DoubleSide,
+    });
+    this.handItemSprite = new THREE.Mesh(itemGeo, itemMat);
+    this.handItemSprite.position.set(0.48, -0.34, -0.72);
+    this.handItemSprite.rotation.set(0.15, -0.45, -0.12);
+    this.handItemSprite.visible = false;
+
     this.handPivot.add(this.handArm);
     this.handPivot.add(this.handCube);
+    this.handPivot.add(this.handItemSprite);
     this.handScene.add(this.handPivot);
   }
 
@@ -356,7 +577,6 @@ export class VoxelEngine {
     this.highlightMesh.visible = false;
     this.scene.add(this.highlightMesh);
 
-    // Build 5 crack overlay stages procedurally
     for (let stage = 0; stage < 5; stage++) {
       const c = document.createElement('canvas');
       c.width = 16;
@@ -396,33 +616,66 @@ export class VoxelEngine {
     if (!itemId) {
       this.handArm.visible = true;
       this.handCube.visible = false;
+      this.handItemSprite.visible = false;
       return;
     }
     const def = getItemDef(itemId);
-    this.handArm.visible = !def?.isBlock;
-    this.handCube.visible = Boolean(def?.isBlock);
+    const isCubeBlock = Boolean(def?.isBlock && !def.isCrossPlane);
 
-    if (def?.isBlock) {
-      const colorMap: Partial<Record<number, number>> = {
-        [BlockId.Grass]: 0x67a93f,
-        [BlockId.Dirt]: 0x865d3b,
-        [BlockId.Stone]: 0x7d7d7d,
-        [BlockId.Cobblestone]: 0x6a6a6a,
-        [BlockId.OakLog]: 0x684e2e,
-        [BlockId.OakPlanks]: 0xba9258,
-        [BlockId.Sand]: 0xdfd39e,
-        [BlockId.Glass]: 0x99d9f2,
-        [BlockId.Bricks]: 0xa14839,
-        [BlockId.CraftingTable]: 0xb38650,
-        [BlockId.Furnace]: 0x777777,
-        [BlockId.Torch]: 0xf5be4e,
-        [BlockId.RedWool]: 0xb52b2b,
-        [BlockId.BlueWool]: 0x2d4db5,
-      };
-      (this.handCube.material as THREE.MeshStandardMaterial).color.setHex(
-        colorMap[itemId] ?? 0xa0a0a0
-      );
+    this.handArm.visible = false;
+    this.handCube.visible = isCubeBlock;
+    this.handItemSprite.visible = !isCubeBlock;
+
+    if (isCubeBlock) {
+      const tiles = getBlockFaceTiles(itemId as BlockId);
+      const faceTiles = [
+        tiles.side,
+        tiles.side,
+        tiles.top,
+        tiles.bottom,
+        tiles.front ?? tiles.side,
+        tiles.side,
+      ];
+      const uvAttr = this.handCube.geometry.getAttribute('uv') as THREE.BufferAttribute;
+      const eps = 0.0012;
+      for (let f = 0; f < 6; f++) {
+        const tileId = faceTiles[f];
+        const tx = tileId % ATLAS_GRID;
+        const ty = Math.floor(tileId / ATLAS_GRID);
+        const uMin = tx / ATLAS_GRID + eps;
+        const uMax = (tx + 1) / ATLAS_GRID - eps;
+        const vMax = 1 - ty / ATLAS_GRID - eps;
+        const vMin = 1 - (ty + 1) / ATLAS_GRID + eps;
+        const base = f * 4;
+        uvAttr.setXY(base + 0, uMin, vMax);
+        uvAttr.setXY(base + 1, uMax, vMax);
+        uvAttr.setXY(base + 2, uMin, vMin);
+        uvAttr.setXY(base + 3, uMax, vMin);
+      }
+      uvAttr.needsUpdate = true;
+    } else {
+      let tex = this.handItemTextures.get(itemId);
+      if (!tex) {
+        const img = new Image();
+        img.src = getItemIconUrl(itemId);
+        tex = new THREE.Texture(img);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.magFilter = THREE.NearestFilter;
+        tex.minFilter = THREE.NearestFilter;
+        img.onload = () => {
+          tex!.needsUpdate = true;
+        };
+        if (img.complete) tex.needsUpdate = true;
+        this.handItemTextures.set(itemId, tex);
+      }
+      const mat = this.handItemSprite.material as THREE.MeshBasicMaterial;
+      mat.map = tex;
+      mat.needsUpdate = true;
     }
+  }
+
+  public setTimeOfDay(time: number) {
+    this.timeOfDay = ((time % 1) + 1) % 1;
   }
 
   public updateSettings(next: GameSettings) {
@@ -491,6 +744,12 @@ export class VoxelEngine {
 
   public triggerPrimaryAction() {
     this.triggerSwing();
+    const hitMobId = this.raycastMob();
+    if (hitMobId !== null) {
+      this.triggerMobHurtFlash(hitMobId);
+      this.callbacks.onHitMob?.(hitMobId);
+      return;
+    }
     if (!this.currentHit) return;
     if (this.gameMode === 'creative') {
       this.breakTargetBlock(this.currentHit);
@@ -540,22 +799,38 @@ export class VoxelEngine {
     }
   }
 
+  private disposeChunkGroup(group: ChunkMeshGroup) {
+    if (group.opaqueMesh) {
+      this.worldGroup.remove(group.opaqueMesh);
+      group.opaqueMesh.geometry.dispose();
+    }
+    if (group.waterMesh) {
+      this.worldGroup.remove(group.waterMesh);
+      group.waterMesh.geometry.dispose();
+    }
+    if (group.cutoutMesh) {
+      this.worldGroup.remove(group.cutoutMesh);
+      group.cutoutMesh.geometry.dispose();
+    }
+    if (group.emissiveMesh) {
+      this.worldGroup.remove(group.emissiveMesh);
+      group.emissiveMesh.geometry.dispose();
+    }
+  }
+
+  public rebuildChunkIfLoaded(cx: number, cz: number) {
+    if (this.disposed) return;
+    const key = `${cx},${cz}`;
+    if (this.chunkMeshes.has(key)) {
+      this.buildAndAttachChunk(cx, cz);
+    }
+  }
+
   private buildAndAttachChunk(cx: number, cz: number) {
     const key = `${cx},${cz}`;
     const existing = this.chunkMeshes.get(key);
     if (existing) {
-      if (existing.opaqueMesh) {
-        this.worldGroup.remove(existing.opaqueMesh);
-        existing.opaqueMesh.geometry.dispose();
-      }
-      if (existing.waterMesh) {
-        this.worldGroup.remove(existing.waterMesh);
-        existing.waterMesh.geometry.dispose();
-      }
-      if (existing.cutoutMesh) {
-        this.worldGroup.remove(existing.cutoutMesh);
-        existing.cutoutMesh.geometry.dispose();
-      }
+      this.disposeChunkGroup(existing);
       this.chunkMeshes.delete(key);
     }
 
@@ -575,6 +850,12 @@ export class VoxelEngine {
       m.receiveShadow = true;
       this.worldGroup.add(m);
       group.cutoutMesh = m;
+    }
+    if (res.emissive) {
+      const m = new THREE.Mesh(res.emissive, this.emissiveMaterial);
+      m.receiveShadow = false;
+      this.worldGroup.add(m);
+      group.emissiveMesh = m;
     }
     if (res.water) {
       const m = new THREE.Mesh(res.water, this.waterMaterial);
@@ -607,26 +888,13 @@ export class VoxelEngine {
       }
     }
 
-    // Unload distant chunks
     for (const [key, group] of this.chunkMeshes.entries()) {
       if (!wanted.has(key)) {
-        if (group.opaqueMesh) {
-          this.worldGroup.remove(group.opaqueMesh);
-          group.opaqueMesh.geometry.dispose();
-        }
-        if (group.waterMesh) {
-          this.worldGroup.remove(group.waterMesh);
-          group.waterMesh.geometry.dispose();
-        }
-        if (group.cutoutMesh) {
-          this.worldGroup.remove(group.cutoutMesh);
-          group.cutoutMesh.geometry.dispose();
-        }
+        this.disposeChunkGroup(group);
         this.chunkMeshes.delete(key);
       }
     }
 
-    // Build nearest chunks first (cap per frame unless initial load)
     missing.sort((a, b) => a[2] - b[2]);
     const limit = forceAll ? missing.length : 2;
     for (let i = 0; i < Math.min(limit, missing.length); i++) {
@@ -668,6 +936,12 @@ export class VoxelEngine {
   };
 
   private onKeyDown = (e: KeyboardEvent) => {
+    // Allow text inputs (e.g. Creative Search) to receive typing keys normally
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') {
+      return;
+    }
+
     if (e.code === 'KeyE' && !e.repeat) {
       this.callbacks.onToggleInventory();
       return;
@@ -750,6 +1024,12 @@ export class VoxelEngine {
     if (e.button === 0) {
       this.isMouseDownLeft = true;
       this.triggerSwing();
+      const hitMobId = this.raycastMob();
+      if (hitMobId !== null) {
+        this.triggerMobHurtFlash(hitMobId);
+        this.callbacks.onHitMob?.(hitMobId);
+        return;
+      }
       if (this.gameMode === 'creative' && this.currentHit) {
         this.breakTargetBlock(this.currentHit);
       }
@@ -769,9 +1049,8 @@ export class VoxelEngine {
   private onWheel = (e: WheelEvent) => {
     if (!this.isActive) return;
     if (Math.abs(e.deltaY) < 4) return;
-    // Delta direction handled in GameViewport via callback
     const dir = e.deltaY > 0 ? 1 : -1;
-    this.callbacks.onSelectHotbarIndex(dir + 100); // sentinel offset for relative wheel scroll
+    this.callbacks.onSelectHotbarIndex(dir + 100);
   };
 
   private triggerSwing() {
@@ -808,7 +1087,25 @@ export class VoxelEngine {
       [BlockId.OakLog]: 0x684e2e,
       [BlockId.OakPlanks]: 0xba9258,
       [BlockId.OakLeaves]: 0x3a7225,
+      [BlockId.BirchLog]: 0xe2dfd7,
+      [BlockId.BirchLeaves]: 0x5c8a3a,
+      [BlockId.SpruceLog]: 0x3b2817,
+      [BlockId.SpruceLeaves]: 0x2d5431,
+      [BlockId.CherryLog]: 0x452b36,
+      [BlockId.CherryLeaves]: 0xf29eb8,
+      [BlockId.BambooBlock]: 0x69992e,
+      [BlockId.Deepslate]: 0x474952,
+      [BlockId.Netherrack]: 0x692828,
+      [BlockId.NetherBricks]: 0x331b22,
+      [BlockId.SoulSand]: 0x4f3c31,
+      [BlockId.EndStone]: 0xdbd79e,
+      [BlockId.PurpurBlock]: 0xa876a7,
+      [BlockId.AmethystBlock]: 0x8558c9,
+      [BlockId.CopperBlock]: 0xbf6443,
+      [BlockId.Obsidian]: 0x1b1229,
       [BlockId.Sand]: 0xdfd39e,
+      [BlockId.Gravel]: 0x837f7e,
+      [BlockId.Cactus]: 0x488a3a,
       [BlockId.Snow]: 0xf2f7fa,
     };
     const col = colorMap[blockId] ?? 0x8a8a8a;
@@ -875,7 +1172,7 @@ export class VoxelEngine {
 
     while (dist <= maxDist) {
       const b = this.world.getBlock(x, y, z);
-      if (b !== BlockId.Air && b !== BlockId.Water) {
+      if (b !== BlockId.Air && b !== BlockId.Water && b !== BlockId.Lava) {
         return {
           blockPos: [x, y, z],
           normal: [nx, ny, nz],
@@ -978,7 +1275,18 @@ export class VoxelEngine {
       Math.floor(this.playerPos.z)
     );
     const inWater = feetBlock === BlockId.Water || headBlock === BlockId.Water;
+    const inLava = feetBlock === BlockId.Lava || headBlock === BlockId.Lava;
     this.isSubmerged = headBlock === BlockId.Water;
+
+    if (inLava && this.gameMode === 'survival') {
+      this.lavaBurnTimer += dt;
+      if (this.lavaBurnTimer >= 0.65) {
+        this.lavaBurnTimer = 0;
+        this.callbacks.onPlayerHurt(3);
+      }
+    } else {
+      this.lavaBurnTimer = 0;
+    }
 
     _vForward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)).normalize();
     _vRight.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw)).normalize();
@@ -991,7 +1299,7 @@ export class VoxelEngine {
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) moveR -= 1;
 
     const isSprinting = this.keys.has('ShiftLeft') || this.keys.has('ControlLeft');
-    const baseSpeed = this.isFlying ? 11.5 : inWater ? 3.2 : isSprinting ? 6.6 : 4.6;
+    const baseSpeed = this.isFlying ? 11.5 : inLava ? 2.1 : inWater ? 3.2 : isSprinting ? 6.6 : 4.6;
 
     let moveX = _vForward.x * moveF + _vRight.x * moveR;
     let moveZ = _vForward.z * moveF + _vRight.z * moveR;
@@ -1013,10 +1321,10 @@ export class VoxelEngine {
       if (this.keys.has('ShiftLeft') || this.keys.has('KeyC')) vy -= 7.5;
       this.velocity.y = THREE.MathUtils.damp(this.velocity.y, vy, 12, dt);
       this.fallStartY = null;
-    } else if (inWater) {
+    } else if (inWater || inLava) {
       this.velocity.y -= 8.0 * dt;
       if (this.keys.has('Space')) {
-        this.velocity.y = 3.8;
+        this.velocity.y = inLava ? 2.6 : 3.8;
       }
       this.velocity.y = THREE.MathUtils.clamp(this.velocity.y, -4, 4.5);
       this.fallStartY = null;
@@ -1028,7 +1336,6 @@ export class VoxelEngine {
       }
     }
 
-    // Separate axis AABB resolution
     const dx = this.velocity.x * dt;
     if (!this.collidesAt(this.playerPos.x + dx, this.playerPos.y, this.playerPos.z)) {
       this.playerPos.x += dx;
@@ -1065,13 +1372,29 @@ export class VoxelEngine {
       this.velocity.y = 0;
     }
 
-    // Safety floor above bedrock
-    if (this.playerPos.y < 1.5) {
-      this.playerPos.y = 28;
-      this.velocity.y = 0;
+    // Bedrock stays walkable (player stands on Bedrock y=0 with feet at y=1.0).
+    // Only recover if somehow fallen below world bounds (or into The End void).
+    if (this.world.dimension === 'end') {
+      if (this.playerPos.y < -14) {
+        const sy = this.world.getSurfaceHeightAt(0, 0) + 2;
+        this.playerPos.set(0.5, sy, 0.5);
+        this.velocity.set(0, 0, 0);
+        if (this.gameMode === 'survival') {
+          this.callbacks.onPlayerHurt(6);
+        }
+      }
+    } else {
+      if (this.playerPos.y < 0.05) {
+        this.playerPos.y = 1.02;
+        this.velocity.y = 0;
+        this.isGrounded = true;
+      }
+      if (this.world.dimension === 'nether' && this.playerPos.y > CHUNK_HEIGHT - 3) {
+        this.playerPos.y = CHUNK_HEIGHT - 3;
+        this.velocity.y = Math.min(0, this.velocity.y);
+      }
     }
 
-    // Footstep sound & subtle head bob
     const horizSpeed = Math.hypot(this.velocity.x, this.velocity.z);
     if (this.isGrounded && horizSpeed > 0.6) {
       this.stepDist += horizSpeed * dt;
@@ -1084,7 +1407,6 @@ export class VoxelEngine {
       this.bobPhase = THREE.MathUtils.damp(this.bobPhase, 0, 8, dt);
     }
 
-    // Apply camera transform
     const bobY = this.isGrounded && horizSpeed > 0.6 ? Math.sin(this.bobPhase) * 0.045 : 0;
     this.camera.position.set(this.playerPos.x, this.playerPos.y + 1.62 + bobY, this.playerPos.z);
     this.camera.rotation.order = 'YXZ';
@@ -1149,34 +1471,78 @@ export class VoxelEngine {
   }
 
   private updateSkyAndLighting(dt: number) {
-    // 1 full day = ~8 minutes
-    this.timeOfDay += dt / 480;
+    this.shaderUniforms.uTime.value += dt;
+    this.skyDome.position.copy(this.playerPos);
+
+    if (this.world.dimension === 'nether') {
+      this.shaderUniforms.uDaylight.value = 0.55;
+      this.skyDomeMat.uniforms.uHorizonColor.value.set(0x5c1812);
+      this.skyDomeMat.uniforms.uZenithColor.value.set(0x210808);
+      this.scene.background = _vNetherFog;
+      if (this.scene.fog instanceof THREE.Fog) {
+        this.scene.fog.color.copy(_vNetherFog);
+      }
+      this.keyLight.color.set(0xffb580);
+      this.keyLight.intensity = 0.85;
+      this.hemiLight.color.set(0x8a382b);
+      this.hemiLight.groundColor.set(0x361412);
+      this.hemiLight.intensity = 0.8;
+      this.keyLight.position.set(this.playerPos.x + 25, this.playerPos.y + 40, this.playerPos.z + 18);
+      this.keyLight.target.position.copy(this.playerPos);
+      return;
+    }
+
+    if (this.world.dimension === 'end') {
+      this.shaderUniforms.uDaylight.value = 0.45;
+      this.skyDomeMat.uniforms.uHorizonColor.value.set(0x22153d);
+      this.skyDomeMat.uniforms.uZenithColor.value.set(0x090512);
+      this.scene.background = _vEndFog;
+      if (this.scene.fog instanceof THREE.Fog) {
+        this.scene.fog.color.copy(_vEndFog);
+      }
+      this.keyLight.color.set(0xd7c4ff);
+      this.keyLight.intensity = 0.9;
+      this.hemiLight.color.set(0x7c64a8);
+      this.hemiLight.groundColor.set(0x2d2440);
+      this.hemiLight.intensity = 0.75;
+      this.keyLight.position.set(this.playerPos.x + 30, this.playerPos.y + 48, this.playerPos.z + 20);
+      this.keyLight.target.position.copy(this.playerPos);
+      return;
+    }
+
+    // Overworld Day-Night Cycle (~6 minutes per full cycle)
+    this.timeOfDay += dt / 360;
     if (this.timeOfDay >= 1) {
       this.timeOfDay -= 1;
       this.dayCount += 1;
     }
 
+    // timeOfDay: 0.0 midnight, 0.25 dawn, 0.50 noon, 0.75 sunset
     const angle = this.timeOfDay * Math.PI * 2 - Math.PI / 2;
     const sunY = Math.sin(angle);
     const sunX = Math.cos(angle);
+    this.shaderUniforms.uSunDir.value.set(sunX, sunY, -0.28).normalize();
 
     this.sunMesh.position.set(
-      this.playerPos.x + sunX * 140,
-      this.playerPos.y + sunY * 140,
-      this.playerPos.z - 40
+      this.playerPos.x + sunX * 150,
+      this.playerPos.y + sunY * 150,
+      this.playerPos.z - 42
     );
     this.moonMesh.position.set(
-      this.playerPos.x - sunX * 140,
-      this.playerPos.y - sunY * 140,
-      this.playerPos.z - 40
+      this.playerPos.x - sunX * 150,
+      this.playerPos.y - sunY * 150,
+      this.playerPos.z - 42
     );
 
-    const daylight = THREE.MathUtils.clamp((sunY + 0.15) / 0.65, 0, 1);
-    const sunsetFactor = 1 - Math.min(1, Math.abs(sunY) / 0.28);
+    const daylight = THREE.MathUtils.clamp((sunY + 0.16) / 0.62, 0, 1);
+    this.shaderUniforms.uDaylight.value = daylight;
+
+    const isDawn = this.timeOfDay < 0.5;
+    const horizonEvent = 1 - Math.min(1, Math.abs(sunY) / 0.3);
 
     _vSkyColor.copy(_vNightSky).lerp(_vDaySky, daylight);
-    if (sunsetFactor > 0.01) {
-      _vSkyColor.lerp(_vSunsetSky, sunsetFactor * 0.48);
+    if (horizonEvent > 0.01) {
+      _vSkyColor.lerp(isDawn ? _vDawnSky : _vSunsetSky, horizonEvent * 0.62);
     }
 
     this.scene.background = _vSkyColor;
@@ -1184,16 +1550,31 @@ export class VoxelEngine {
       this.scene.fog.color.copy(_vSkyColor);
     }
 
-    this.keyLight.intensity = 0.25 + daylight * 1.25;
-    this.hemiLight.intensity = 0.3 + daylight * 0.65;
+    const zenithDay = new THREE.Color(0x4183eb);
+    const zenithNight = new THREE.Color(0x050914);
+    const zenithCol = zenithNight.clone().lerp(zenithDay, daylight);
+    if (horizonEvent > 0.01) {
+      zenithCol.lerp(new THREE.Color(isDawn ? 0x5c537a : 0x4e355c), horizonEvent * 0.45);
+    }
+    this.skyDomeMat.uniforms.uHorizonColor.value.copy(_vSkyColor);
+    this.skyDomeMat.uniforms.uZenithColor.value.copy(zenithCol);
+
+    // Directional & Hemisphere light warmth across day-night
+    const sunColor = new THREE.Color(0x9fb8ff).lerp(new THREE.Color(0xfff3db), daylight);
+    if (horizonEvent > 0.01) {
+      sunColor.lerp(new THREE.Color(0xff9c5e), horizonEvent * 0.65);
+    }
+    this.keyLight.color.copy(sunColor);
+    this.keyLight.intensity = 0.28 + daylight * 1.3;
+    this.hemiLight.intensity = 0.34 + daylight * 0.65;
+
     this.keyLight.position.set(
       this.playerPos.x + sunX * 45,
-      this.playerPos.y + Math.max(15, Math.abs(sunY) * 75),
+      this.playerPos.y + Math.max(16, Math.abs(sunY) * 75),
       this.playerPos.z + 25
     );
     this.keyLight.target.position.copy(this.playerPos);
 
-    // Drift clouds gently
     this.cloudGroup.position.x = this.playerPos.x;
     this.cloudGroup.position.z = this.playerPos.z;
     for (const c of this.cloudGroup.children) {
@@ -1217,7 +1598,6 @@ export class VoxelEngine {
       p.mesh.rotation.y += dt * 4;
     }
 
-    // Viewmodel swing + walk sway
     if (this.isSwinging) {
       this.swingProgress += dt * 5.2;
       if (this.swingProgress >= 1) {
@@ -1270,6 +1650,7 @@ export class VoxelEngine {
         yawDeg: Math.round(yawDeg),
         pitchDeg: Math.round((this.pitch * 180) / Math.PI),
         biome: this.world.getBiomeAt(wx, wz),
+        dimension: this.world.dimension,
         targetBlock: targetDef?.name ?? null,
         targetCoords: this.currentHit ? this.currentHit.blockPos : null,
         timeOfDayLabel: `${hh}:${mm}`,
@@ -1303,6 +1684,203 @@ export class VoxelEngine {
     this.frameId = window.setTimeout(poll, 5);
   }
 
+  public syncMobs(mobs: MobEntityDto[]) {
+    const activeIds = new Set<number>();
+    for (const dto of mobs) {
+      activeIds.add(dto.id);
+      const existing = this.mobVisuals.get(dto.id);
+      if (existing) {
+        existing.dto = dto;
+        existing.targetPos.set(dto.x, dto.y, dto.z);
+        existing.targetYaw = dto.yaw;
+        if (dto.hurtTimer > existing.hurtTimer) {
+          existing.hurtTimer = dto.hurtTimer;
+        }
+      } else {
+        const visual = this.buildMobVisual(dto);
+        this.mobGroup.add(visual.group);
+        this.mobVisuals.set(dto.id, visual);
+      }
+    }
+
+    for (const [id, visual] of this.mobVisuals.entries()) {
+      if (!activeIds.has(id)) {
+        this.disposeMobVisual(visual);
+        this.mobVisuals.delete(id);
+      }
+    }
+  }
+
+  public triggerMobHurtFlash(mobId: number) {
+    const visual = this.mobVisuals.get(mobId);
+    if (visual) {
+      visual.hurtTimer = 0.35;
+    }
+  }
+
+  private buildMobVisual(dto: MobEntityDto): MobVisual {
+    const group = new THREE.Group();
+    const limbs: THREE.Mesh[] = [];
+    const materials: THREE.MeshStandardMaterial[] = [];
+    const { primary, secondary, accent } = dto.palette;
+
+    const makePart = (
+      w: number,
+      h: number,
+      d: number,
+      colorHex: number,
+      x: number,
+      y: number,
+      z: number,
+      transparent = false,
+      opacity = 1
+    ) => {
+      const geo = new THREE.BoxGeometry(w, h, d);
+      const mat = new THREE.MeshStandardMaterial({
+        color: colorHex,
+        roughness: 0.85,
+        metalness: 0.05,
+        transparent,
+        opacity,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x, y, z);
+      mesh.castShadow = !this.isSoftwareGl;
+      mesh.receiveShadow = true;
+      materials.push(mat);
+      group.add(mesh);
+      return mesh;
+    };
+
+    if (dto.type === 'sheep' || dto.type === 'cow') {
+      makePart(0.68, 0.56, 0.96, primary, 0, 0.68, 0);
+      makePart(0.46, 0.44, 0.46, secondary, 0, 0.88, -0.58);
+      makePart(0.08, 0.08, 0.05, accent, -0.13, 0.94, -0.81);
+      makePart(0.08, 0.08, 0.05, accent, 0.13, 0.94, -0.81);
+      if (dto.type === 'cow') {
+        makePart(0.08, 0.14, 0.08, accent, -0.22, 1.14, -0.55);
+        makePart(0.08, 0.14, 0.08, accent, 0.22, 1.14, -0.55);
+        makePart(0.32, 0.28, 0.4, secondary, 0.19, 0.72, 0.08);
+      }
+      const legColor = dto.type === 'cow' ? accent : secondary;
+      limbs.push(
+        makePart(0.18, 0.42, 0.18, legColor, -0.2, 0.21, -0.32),
+        makePart(0.18, 0.42, 0.18, legColor, 0.2, 0.21, -0.32),
+        makePart(0.18, 0.42, 0.18, legColor, -0.2, 0.21, 0.32),
+        makePart(0.18, 0.42, 0.18, legColor, 0.2, 0.21, 0.32)
+      );
+    } else if (dto.type === 'zombie') {
+      makePart(0.44, 0.44, 0.44, primary, 0, 1.56, 0);
+      makePart(0.08, 0.07, 0.04, 0x172515, -0.1, 1.6, -0.22);
+      makePart(0.08, 0.07, 0.04, 0x172515, 0.1, 1.6, -0.22);
+      makePart(0.46, 0.68, 0.26, secondary, 0, 1.0, 0);
+      makePart(0.18, 0.18, 0.54, primary, -0.33, 1.2, -0.24);
+      makePart(0.18, 0.18, 0.54, primary, 0.33, 1.2, -0.24);
+      limbs.push(
+        makePart(0.2, 0.66, 0.22, accent, -0.12, 0.33, 0),
+        makePart(0.2, 0.66, 0.22, accent, 0.12, 0.33, 0)
+      );
+    } else {
+      makePart(0.84, 0.84, 0.84, primary, 0, 0.42, 0, true, 0.72);
+      makePart(0.52, 0.52, 0.52, secondary, 0, 0.42, 0);
+      makePart(0.1, 0.1, 0.06, accent, -0.15, 0.5, -0.42);
+      makePart(0.1, 0.1, 0.06, accent, 0.15, 0.5, -0.42);
+    }
+
+    group.position.set(dto.x, dto.y, dto.z);
+    group.rotation.y = dto.yaw;
+    return {
+      group,
+      limbs,
+      materials,
+      dto,
+      targetPos: new THREE.Vector3(dto.x, dto.y, dto.z),
+      targetYaw: dto.yaw,
+      hurtTimer: dto.hurtTimer,
+    };
+  }
+
+  private disposeMobVisual(visual: MobVisual) {
+    this.mobGroup.remove(visual.group);
+    visual.group.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        if (Array.isArray(child.material)) {
+          child.material.forEach((m) => m.dispose());
+        } else {
+          child.material.dispose();
+        }
+      }
+    });
+  }
+
+  private raycastMob(): number | null {
+    const eyeY = this.playerPos.y + 1.62;
+    _vRayOrigin.set(this.playerPos.x, eyeY, this.playerPos.z);
+    const cosPitch = Math.cos(this.pitch);
+    _vRayDir.set(
+      -Math.sin(this.yaw) * cosPitch,
+      Math.sin(this.pitch),
+      -Math.cos(this.yaw) * cosPitch
+    ).normalize();
+
+    let bestId: number | null = null;
+    let bestDist = 4.2;
+
+    for (const [id, visual] of this.mobVisuals.entries()) {
+      const pos = visual.group.position;
+      const halfW = visual.dto.width * 0.6;
+      const centerY = pos.y + visual.dto.height * 0.5;
+      const toMobX = pos.x - _vRayOrigin.x;
+      const toMobY = centerY - _vRayOrigin.y;
+      const toMobZ = pos.z - _vRayOrigin.z;
+      const proj = toMobX * _vRayDir.x + toMobY * _vRayDir.y + toMobZ * _vRayDir.z;
+      if (proj < 0 || proj > bestDist) continue;
+
+      const closestX = _vRayOrigin.x + _vRayDir.x * proj;
+      const closestY = _vRayOrigin.y + _vRayDir.y * proj;
+      const closestZ = _vRayOrigin.z + _vRayDir.z * proj;
+      const dx = closestX - pos.x;
+      const dy = Math.abs(closestY - centerY);
+      const dz = closestZ - pos.z;
+
+      if (Math.hypot(dx, dz) <= halfW + 0.15 && dy <= visual.dto.height * 0.58) {
+        bestDist = proj;
+        bestId = id;
+      }
+    }
+    return bestId;
+  }
+
+  private updateMobs(dt: number) {
+    for (const visual of this.mobVisuals.values()) {
+      visual.group.position.lerp(visual.targetPos, Math.min(1, dt * 8));
+      const diffYaw = Math.atan2(
+        Math.sin(visual.targetYaw - visual.group.rotation.y),
+        Math.cos(visual.targetYaw - visual.group.rotation.y)
+      );
+      visual.group.rotation.y += diffYaw * Math.min(1, dt * 8);
+
+      const swing = Math.sin(visual.dto.walkPhase) * 0.45;
+      if (visual.limbs.length === 4) {
+        visual.limbs[0].rotation.x = swing;
+        visual.limbs[1].rotation.x = -swing;
+        visual.limbs[2].rotation.x = -swing;
+        visual.limbs[3].rotation.x = swing;
+      } else if (visual.limbs.length === 2) {
+        visual.limbs[0].rotation.x = swing;
+        visual.limbs[1].rotation.x = -swing;
+      }
+
+      visual.hurtTimer = Math.max(0, visual.hurtTimer - dt);
+      const isHurt = visual.hurtTimer > 0;
+      for (const mat of visual.materials) {
+        mat.emissive.setHex(isHurt ? 0xb91c1c : 0x000000);
+        mat.emissiveIntensity = isHurt ? 0.65 : 0;
+      }
+    }
+  }
+
   private startLoop() {
     const tick = () => {
       if (this.disposed) return;
@@ -1315,6 +1893,7 @@ export class VoxelEngine {
       this.updateMiningAndTarget(dt);
       this.updateSkyAndLighting(dt);
       this.updateParticlesAndHand(dt);
+      this.updateMobs(dt);
       this.emitTelemetry(dt);
 
       this.renderer.clear();
@@ -1353,18 +1932,28 @@ export class VoxelEngine {
     this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
     this.renderer.domElement.removeEventListener('webglcontextrestored', this.handleContextRestored);
 
+    for (const visual of this.mobVisuals.values()) {
+      this.disposeMobVisual(visual);
+    }
+    this.mobVisuals.clear();
     for (const group of this.chunkMeshes.values()) {
       group.opaqueMesh?.geometry.dispose();
       group.waterMesh?.geometry.dispose();
       group.cutoutMesh?.geometry.dispose();
+      group.emissiveMesh?.geometry.dispose();
     }
     this.chunkMeshes.clear();
+    this.skyDome.geometry.dispose();
+    this.skyDomeMat.dispose();
     this.opaqueMaterial.dispose();
     this.cutoutMaterial.dispose();
     this.waterMaterial.dispose();
+    this.emissiveMaterial.dispose();
     this.atlasTexture.dispose();
     this.particleGeo.dispose();
     this.crackTextures.forEach((t) => t.dispose());
+    this.handItemTextures.forEach((t) => t.dispose());
+    this.handItemTextures.clear();
     this.renderer.dispose();
     if (this.renderer.domElement.parentNode === this.container) {
       this.container.removeChild(this.renderer.domElement);

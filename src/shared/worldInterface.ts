@@ -1,4 +1,4 @@
-import { BiomeType, BlockId, TerrainType } from './types';
+import { BiomeType, BlockId, DimensionId, TerrainType } from './types';
 
 export const CHUNK_SIZE = 16;
 export const CHUNK_HEIGHT = 64;
@@ -12,11 +12,11 @@ export interface ChunkData {
 
 /**
  * Shared contract between Frontend Renderer/HUD and Backend World/Chunk Generation.
- * Backend developers can implement this interface (via WebSocket/REST) and swap in seamlessly.
  */
 export interface IWorldProvider {
   readonly seed: string;
   readonly terrainType: TerrainType;
+  readonly dimension: DimensionId;
   getChunk(cx: number, cz: number): ChunkData;
   getBlock(wx: number, wy: number, wz: number): BlockId;
   setBlock(wx: number, wy: number, wz: number, blockId: BlockId): void;

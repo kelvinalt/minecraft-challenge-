@@ -1,6 +1,7 @@
 import { AnyItemId, BlockId, CraftingRecipe, ItemId } from './types';
 
 export const CRAFTING_RECIPES: CraftingRecipe[] = [
+  // Wood logs -> Planks
   {
     id: 'oak_planks',
     result: { itemId: BlockId.OakPlanks, count: 4 },
@@ -8,15 +9,68 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
     requiresTable: false,
   },
   {
+    id: 'birch_planks',
+    result: { itemId: BlockId.BirchPlanks, count: 4 },
+    shapeless: [BlockId.BirchLog],
+    requiresTable: false,
+  },
+  {
+    id: 'spruce_planks',
+    result: { itemId: BlockId.SprucePlanks, count: 4 },
+    shapeless: [BlockId.SpruceLog],
+    requiresTable: false,
+  },
+  {
+    id: 'cherry_planks',
+    result: { itemId: BlockId.CherryPlanks, count: 4 },
+    shapeless: [BlockId.CherryLog],
+    requiresTable: false,
+  },
+  {
+    id: 'bamboo_planks',
+    result: { itemId: BlockId.BambooPlanks, count: 2 },
+    shapeless: [BlockId.BambooBlock],
+    requiresTable: false,
+  },
+
+  // Sticks from any planks
+  {
     id: 'sticks',
     result: { itemId: ItemId.Stick, count: 4 },
-    pattern: [
-      ['P'],
-      ['P'],
-    ],
+    pattern: [['P'], ['P']],
     key: { P: BlockId.OakPlanks },
     requiresTable: false,
   },
+  {
+    id: 'sticks_birch',
+    result: { itemId: ItemId.Stick, count: 4 },
+    pattern: [['P'], ['P']],
+    key: { P: BlockId.BirchPlanks },
+    requiresTable: false,
+  },
+  {
+    id: 'sticks_spruce',
+    result: { itemId: ItemId.Stick, count: 4 },
+    pattern: [['P'], ['P']],
+    key: { P: BlockId.SprucePlanks },
+    requiresTable: false,
+  },
+  {
+    id: 'sticks_cherry',
+    result: { itemId: ItemId.Stick, count: 4 },
+    pattern: [['P'], ['P']],
+    key: { P: BlockId.CherryPlanks },
+    requiresTable: false,
+  },
+  {
+    id: 'sticks_bamboo',
+    result: { itemId: ItemId.Stick, count: 4 },
+    pattern: [['P'], ['P']],
+    key: { P: BlockId.BambooPlanks },
+    requiresTable: false,
+  },
+
+  // Crafting Table from any planks
   {
     id: 'crafting_table',
     result: { itemId: BlockId.CraftingTable, count: 1 },
@@ -28,15 +82,56 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
     requiresTable: false,
   },
   {
-    id: 'torch_lamp',
-    result: { itemId: BlockId.Torch, count: 4 },
+    id: 'crafting_table_birch',
+    result: { itemId: BlockId.CraftingTable, count: 1 },
     pattern: [
-      ['C'],
-      ['S'],
+      ['P', 'P'],
+      ['P', 'P'],
     ],
+    key: { P: BlockId.BirchPlanks },
+    requiresTable: false,
+  },
+  {
+    id: 'crafting_table_spruce',
+    result: { itemId: BlockId.CraftingTable, count: 1 },
+    pattern: [
+      ['P', 'P'],
+      ['P', 'P'],
+    ],
+    key: { P: BlockId.SprucePlanks },
+    requiresTable: false,
+  },
+  {
+    id: 'crafting_table_cherry',
+    result: { itemId: BlockId.CraftingTable, count: 1 },
+    pattern: [
+      ['P', 'P'],
+      ['P', 'P'],
+    ],
+    key: { P: BlockId.CherryPlanks },
+    requiresTable: false,
+  },
+
+  // Torches & Lights
+  {
+    id: 'torch',
+    result: { itemId: BlockId.Torch, count: 4 },
+    pattern: [['C'], ['S']],
     key: { C: ItemId.Coal, S: ItemId.Stick },
     requiresTable: false,
   },
+  {
+    id: 'glowstone',
+    result: { itemId: BlockId.Glowstone, count: 1 },
+    pattern: [
+      ['C', 'G'],
+      ['G', 'C'],
+    ],
+    key: { C: ItemId.Coal, G: ItemId.GoldIngot },
+    requiresTable: false,
+  },
+
+  // Building variants
   {
     id: 'sandstone',
     result: { itemId: BlockId.Sandstone, count: 1 },
@@ -45,6 +140,32 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
       ['S', 'S'],
     ],
     key: { S: BlockId.Sand },
+    requiresTable: false,
+  },
+  {
+    id: 'stone_bricks',
+    result: { itemId: BlockId.StoneBricks, count: 4 },
+    pattern: [
+      ['C', 'C'],
+      ['C', 'C'],
+    ],
+    key: { C: BlockId.Cobblestone },
+    requiresTable: false,
+  },
+  {
+    id: 'mossy_cobblestone',
+    result: { itemId: BlockId.MossyCobblestone, count: 1 },
+    shapeless: [BlockId.Cobblestone, BlockId.TallGrass],
+    requiresTable: false,
+  },
+  {
+    id: 'mud_bricks',
+    result: { itemId: BlockId.MudBricks, count: 4 },
+    pattern: [
+      ['D', 'S'],
+      ['S', 'D'],
+    ],
+    key: { D: BlockId.Dirt, S: BlockId.Sand },
     requiresTable: false,
   },
   {
@@ -58,6 +179,80 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
     requiresTable: false,
   },
   {
+    id: 'bricks',
+    result: { itemId: BlockId.Bricks, count: 4 },
+    pattern: [
+      ['C', 'D'],
+      ['D', 'C'],
+    ],
+    key: { C: BlockId.Cobblestone, D: BlockId.Dirt },
+    requiresTable: false,
+  },
+  {
+    id: 'nether_bricks',
+    result: { itemId: BlockId.NetherBricks, count: 4 },
+    pattern: [
+      ['N', 'N'],
+      ['N', 'N'],
+    ],
+    key: { N: BlockId.Netherrack },
+    requiresTable: false,
+  },
+  {
+    id: 'purpur_block',
+    result: { itemId: BlockId.PurpurBlock, count: 4 },
+    pattern: [
+      ['E', 'E'],
+      ['E', 'E'],
+    ],
+    key: { E: BlockId.EndStone },
+    requiresTable: false,
+  },
+  {
+    id: 'nether_portal',
+    result: { itemId: BlockId.NetherPortal, count: 1 },
+    pattern: [
+      ['O', 'O', 'O'],
+      ['O', 'D', 'O'],
+      ['O', 'O', 'O'],
+    ],
+    key: { O: BlockId.Obsidian, D: ItemId.Diamond },
+    requiresTable: true,
+  },
+  {
+    id: 'end_portal',
+    result: { itemId: BlockId.EndPortal, count: 1 },
+    pattern: [
+      ['E', 'D', 'E'],
+      ['D', 'O', 'D'],
+      ['E', 'D', 'E'],
+    ],
+    key: { E: BlockId.EndStone, D: ItemId.Diamond, O: BlockId.Obsidian },
+    requiresTable: true,
+  },
+  {
+    id: 'bookshelf',
+    result: { itemId: BlockId.Bookshelf, count: 1 },
+    pattern: [
+      ['P', 'P', 'P'],
+      ['S', 'S', 'S'],
+      ['P', 'P', 'P'],
+    ],
+    key: { P: BlockId.OakPlanks, S: ItemId.Stick },
+    requiresTable: true,
+  },
+  {
+    id: 'tnt',
+    result: { itemId: BlockId.TNT, count: 1 },
+    pattern: [
+      ['C', 'S', 'C'],
+      ['S', 'C', 'S'],
+      ['C', 'S', 'C'],
+    ],
+    key: { C: ItemId.Coal, S: BlockId.Sand },
+    requiresTable: true,
+  },
+  {
     id: 'furnace',
     result: { itemId: BlockId.Furnace, count: 1 },
     pattern: [
@@ -68,16 +263,8 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
     key: { C: BlockId.Cobblestone },
     requiresTable: true,
   },
-  {
-    id: 'bricks',
-    result: { itemId: BlockId.Bricks, count: 4 },
-    pattern: [
-      ['C', 'D'],
-      ['D', 'C'],
-    ],
-    key: { C: BlockId.Cobblestone, D: BlockId.Dirt },
-    requiresTable: false,
-  },
+
+  // Tools
   {
     id: 'wooden_pickaxe',
     result: { itemId: ItemId.WoodenPickaxe, count: 1 },
@@ -147,36 +334,23 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
   {
     id: 'wooden_sword',
     result: { itemId: ItemId.WoodenSword, count: 1 },
-    pattern: [
-      ['P'],
-      ['P'],
-      ['S'],
-    ],
+    pattern: [['P'], ['P'], ['S']],
     key: { P: BlockId.OakPlanks, S: ItemId.Stick },
     requiresTable: true,
   },
   {
     id: 'stone_sword',
     result: { itemId: ItemId.StoneSword, count: 1 },
-    pattern: [
-      ['C'],
-      ['C'],
-      ['S'],
-    ],
+    pattern: [['C'], ['C'], ['S']],
     key: { C: BlockId.Cobblestone, S: ItemId.Stick },
     requiresTable: true,
   },
 ];
 
-/**
- * Matches a 2x2 or 3x3 grid of item IDs against all crafting recipes.
- * Supports sub-grid translation (e.g. a 1x2 Stick pattern anywhere in a 2x2 or 3x3 grid).
- */
 export function matchCraftingRecipe(
   grid: (AnyItemId | null)[],
   gridSize: 2 | 3
 ): CraftingRecipe | null {
-  // Trim bounding box of non-empty items in grid
   let minR: number = gridSize;
   let maxR = -1;
   let minC: number = gridSize;

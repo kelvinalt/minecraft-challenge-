@@ -1,0 +1,22 @@
+{
+  "id": "emerald-valley",
+  "name": "Emerald Valley",
+  "seed": "4829104",
+  "gameMode": "survival",
+  "terrainType": "normal",
+  "dimension": "overworld",
+  "createdAt": 1795083192316,
+  "lastPlayedAt": 1795255996955,
+  "health": 20,
+  "hunger": 18,
+  "selectedSlot": 0,
+  "timeOfDay": 0.28,
+  "modifiedBlocksByDim": {
+    "overworld": {
+      "2,25,2": 38
+    }
+  },
+  "modifiedBlocks": {
+    "2,25,2": 38
+  }
+}

@@ -1,8 +1,9 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import {
   AnyItemId,
   BlockId,
   DebugTelemetry,
+  DimensionId,
   GameMode,
   GameSettings,
   InventorySlot,
@@ -13,6 +14,7 @@ import {
   WorldConfig,
 } from '../../shared/types';
 import { ALL_CREATIVE_ITEMS, getItemDef } from '../../shared/blocks';
+import { worldApi } from '../api/worldApi';
 import { soundFX } from '../engine/SoundFX';
 
 const WORLDS_STORAGE_KEY = 'blockcraft_worlds_v1';
@@ -107,9 +109,21 @@ interface GameContextValue {
 
   worlds: WorldConfig[];
   activeWorld: WorldConfig | null;
+  activeDimension: DimensionId;
+  preloadedChunksRef: React.MutableRefObject<Map<string, Uint8Array>>;
   launchWorld: (worldId: string) => void;
-  createWorld: (name: string, seed: string, gameMode: GameMode, terrainType: TerrainType) => void;
+  createWorld: (name: string, seed: string, gameMode: GameMode, terrainType: TerrainType) => Promise<void>;
   deleteWorld: (worldId: string) => void;
+  switchDimension: (
+    nextDim: DimensionId,
+    currentModified: Record<string, number>,
+    timeOfDay: number
+  ) => void;
+  saveWorldProgress: (
+    modifiedBlocks: Record<string, number>,
+    playerPos: [number, number, number],
+    timeOfDay: number
+  ) => Promise<void>;
   saveAndQuitWorld: (
     modifiedBlocks: Record<string, number>,
     playerPos: [number, number, number],
@@ -128,13 +142,19 @@ interface GameContextValue {
   setHealth: React.Dispatch<React.SetStateAction<number>>;
   hunger: number;
   setHunger: React.Dispatch<React.SetStateAction<number>>;
-  addItemToInventory: (itemId: AnyItemId, count: number) => void;
+  xp: number;
+  addXp: (amount: number) => void;
+  lastHurtAt: number;
+  markPlayerHurt: () => void;
+  addItemToInventory: (itemId: AnyItemId, count: number, durability?: number) => void;
   consumeSelectedHotbarItem: () => void;
   damageHeldTool: () => void;
 
-  // Crafting table mode
+  // Crafting table & furnace modes
   craftingTableOpen: boolean;
   setCraftingTableOpen: (open: boolean) => void;
+  furnaceOpen: boolean;
+  setFurnaceOpen: (open: boolean) => void;
 
   // HUD / Engine telemetry
   telemetry: DebugTelemetry;
@@ -173,6 +193,8 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   });
 
   const [activeWorldId, setActiveWorldId] = useState<string | null>(null);
+  const [activeDimension, setActiveDimension] = useState<DimensionId>('overworld');
+  const preloadedChunksRef = useRef<Map<string, Uint8Array>>(new Map());
 
   const [settings, setSettings] = useState<GameSettings>(() => {
     try {
@@ -190,7 +212,10 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [selectedHotbarSlot, setSelectedHotbarSlot] = useState(0);
   const [health, setHealth] = useState(20);
   const [hunger, setHunger] = useState(20);
+  const [xp, setXp] = useState(0);
+  const [lastHurtAt, setLastHurtAt] = useState(0);
   const [craftingTableOpen, setCraftingTableOpen] = useState(false);
+  const [furnaceOpen, setFurnaceOpen] = useState(false);
 
   const [telemetry, setTelemetry] = useState<DebugTelemetry>({
     fps: 60,
@@ -200,6 +225,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     yawDeg: 0,
     pitchDeg: 0,
     biome: 'Plains',
+    dimension: 'overworld',
     targetBlock: null,
     targetCoords: null,
     timeOfDayLabel: '08:00',
@@ -215,6 +241,27 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [pointerLocked, setPointerLocked] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(0);
   const [loadingStatus, setLoadingStatus] = useState('Building terrain...');
+
+  // Hydrate authoritative worlds and settings from Express backend on startup
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const [serverWorlds, serverSettings] = await Promise.all([
+        worldApi.listWorlds(),
+        worldApi.getSettings(),
+      ]);
+      if (cancelled) return;
+      if (serverWorlds && serverWorlds.length > 0) {
+        setWorlds(serverWorlds);
+      }
+      if (serverSettings) {
+        setSettings(serverSettings);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     soundFX.setVolume(settings.masterVolume);
@@ -241,7 +288,11 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const updateSettings = useCallback((patch: Partial<GameSettings>) => {
-    setSettings((prev) => ({ ...prev, ...patch }));
+    setSettings((prev) => {
+      const next = { ...prev, ...patch };
+      void worldApi.saveSettings(next);
+      return next;
+    });
   }, []);
 
   const launchWorld = useCallback(
@@ -249,34 +300,56 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const target = worlds.find((w) => w.id === worldId);
       if (!target) return;
 
+      preloadedChunksRef.current.clear();
       setActiveWorldId(worldId);
+      setActiveDimension(target.dimension ?? 'overworld');
       setInventory(target.inventory ?? createStarterInventory(target.gameMode));
       setHealth(target.health ?? 20);
       setHunger(target.hunger ?? 20);
       setSelectedHotbarSlot(target.selectedSlot ?? 0);
       setCraftingTableOpen(false);
+      setFurnaceOpen(false);
       setLoadingProgress(0);
-      setLoadingStatus('Generating world chunks...');
+      setLoadingStatus('Connecting to world server...');
       setScreen('loading');
 
       setWorlds((prev) =>
         prev.map((w) => (w.id === worldId ? { ...w, lastPlayedAt: Date.now() } : w))
       );
+
+      // Pull latest saved world snapshot from backend
+      void worldApi.getWorld(worldId).then((fresh) => {
+        if (!fresh) return;
+        setWorlds((prev) => prev.map((w) => (w.id === worldId ? fresh : w)));
+        setActiveDimension(fresh.dimension ?? 'overworld');
+        if (fresh.inventory) setInventory(fresh.inventory);
+        if (fresh.health !== undefined) setHealth(fresh.health);
+        if (fresh.hunger !== undefined) setHunger(fresh.hunger);
+        if (fresh.selectedSlot !== undefined) setSelectedHotbarSlot(fresh.selectedSlot);
+      });
     },
     [worlds]
   );
 
   const createWorld = useCallback(
-    (name: string, seed: string, gameMode: GameMode, terrainType: TerrainType) => {
-      const id = `world-${Date.now().toString(36)}`;
+    async (name: string, seed: string, gameMode: GameMode, terrainType: TerrainType) => {
       const cleanName = name.trim() || 'New World';
       const cleanSeed = seed.trim() || String(Math.floor(100000 + Math.random() * 900000));
-      const newWorld: WorldConfig = {
-        id,
+
+      const createdFromServer = await worldApi.createWorld({
         name: cleanName,
         seed: cleanSeed,
         gameMode,
         terrainType,
+      });
+
+      const newWorld: WorldConfig = createdFromServer ?? {
+        id: `world-${Date.now().toString(36)}`,
+        name: cleanName,
+        seed: cleanSeed,
+        gameMode,
+        terrainType,
+        dimension: 'overworld',
         createdAt: Date.now(),
         lastPlayedAt: Date.now(),
         health: 20,
@@ -284,13 +357,18 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         selectedSlot: 0,
         timeOfDay: 0.28,
       };
-      setWorlds((prev) => [newWorld, ...prev]);
-      setActiveWorldId(id);
+
+      preloadedChunksRef.current.clear();
+      setWorlds((prev) => [newWorld, ...prev.filter((w) => w.id !== newWorld.id)]);
+      setActiveWorldId(newWorld.id);
+      setActiveDimension('overworld');
       setInventory(createStarterInventory(gameMode));
       setHealth(20);
       setHunger(20);
+      setXp(0);
       setSelectedHotbarSlot(0);
       setCraftingTableOpen(false);
+      setFurnaceOpen(false);
       setLoadingProgress(0);
       setLoadingStatus('Generating terrain...');
       setScreen('loading');
@@ -300,7 +378,100 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const deleteWorld = useCallback((worldId: string) => {
     setWorlds((prev) => prev.filter((w) => w.id !== worldId));
+    void worldApi.deleteWorld(worldId);
   }, []);
+
+  const switchDimension = useCallback(
+    (nextDim: DimensionId, currentModified: Record<string, number>, timeOfDay: number) => {
+      if (!activeWorldId || nextDim === activeDimension) return;
+      preloadedChunksRef.current.clear();
+
+      const existing = worlds.find((w) => w.id === activeWorldId);
+      const nextByDim = {
+        ...(existing?.modifiedBlocksByDim ?? {}),
+        [activeDimension]: currentModified,
+      };
+
+      setWorlds((prev) =>
+        prev.map((w) =>
+          w.id === activeWorldId
+            ? {
+                ...w,
+                dimension: nextDim,
+                modifiedBlocks: activeDimension === 'overworld' ? currentModified : w.modifiedBlocks,
+                modifiedBlocksByDim: nextByDim,
+                playerPosition: undefined,
+                timeOfDay,
+              }
+            : w
+        )
+      );
+
+      void worldApi.saveWorldState(activeWorldId, {
+        dimension: nextDim,
+        modifiedBlocksByDim: nextByDim,
+        playerPosition: null,
+        timeOfDay,
+        inventory,
+        health,
+        hunger,
+        selectedSlot: selectedHotbarSlot,
+      });
+
+      setActiveDimension(nextDim);
+      setCraftingTableOpen(false);
+      setFurnaceOpen(false);
+      setScreen('playing');
+    },
+    [activeWorldId, activeDimension, worlds, inventory, health, hunger, selectedHotbarSlot]
+  );
+
+  const saveWorldProgress = useCallback(
+    async (
+      modifiedBlocks: Record<string, number>,
+      playerPos: [number, number, number],
+      timeOfDay: number
+    ) => {
+      if (!activeWorldId) return;
+      const existing = worlds.find((w) => w.id === activeWorldId);
+      const byDim = {
+        ...(existing?.modifiedBlocksByDim ?? {}),
+        [activeDimension]: modifiedBlocks,
+      };
+
+      setWorlds((prev) =>
+        prev.map((w) => {
+          if (w.id !== activeWorldId) return w;
+          return {
+            ...w,
+            lastPlayedAt: Date.now(),
+            dimension: activeDimension,
+            modifiedBlocks: activeDimension === 'overworld' ? modifiedBlocks : w.modifiedBlocks,
+            modifiedBlocksByDim: byDim,
+            playerPosition: playerPos,
+            inventory,
+            health,
+            hunger,
+            selectedSlot: selectedHotbarSlot,
+            timeOfDay,
+          };
+        })
+      );
+
+      await worldApi.saveWorldState(activeWorldId, {
+        dimension: activeDimension,
+        modifiedBlocksByDim: byDim,
+        playerPosition: playerPos,
+        inventory,
+        health,
+        hunger,
+        selectedSlot: selectedHotbarSlot,
+        timeOfDay,
+        gameMode: existing?.gameMode,
+      });
+    },
+    [activeWorldId, activeDimension, worlds, health, hunger, inventory, selectedHotbarSlot]
+  );
 
   const saveAndQuitWorld = useCallback(
     (
@@ -308,77 +479,74 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       playerPos: [number, number, number],
       timeOfDay: number
     ) => {
-      if (activeWorldId) {
-        setWorlds((prev) =>
-          prev.map((w) =>
-            w.id === activeWorldId
-              ? {
-                  ...w,
-                  lastPlayedAt: Date.now(),
-                  modifiedBlocks,
-                  playerPosition: playerPos,
-                  inventory,
-                  health,
-                  hunger,
-                  selectedSlot: selectedHotbarSlot,
-                  timeOfDay,
-                }
-              : w
-          )
-        );
-      }
+      void saveWorldProgress(modifiedBlocks, playerPos, timeOfDay);
+      preloadedChunksRef.current.clear();
       setActiveWorldId(null);
       setCraftingTableOpen(false);
+      setFurnaceOpen(false);
       setScreen('main_menu');
     },
-    [activeWorldId, health, hunger, inventory, selectedHotbarSlot]
+    [saveWorldProgress]
   );
 
   const toggleGameMode = useCallback(() => {
     if (!activeWorldId) return;
     setWorlds((prev) =>
-      prev.map((w) =>
-        w.id === activeWorldId
-          ? { ...w, gameMode: w.gameMode === 'survival' ? 'creative' : 'survival' }
-          : w
-      )
+      prev.map((w) => {
+        if (w.id !== activeWorldId) return w;
+        const nextMode: GameMode = w.gameMode === 'survival' ? 'creative' : 'survival';
+        void worldApi.saveWorldState(activeWorldId, { gameMode: nextMode });
+        return { ...w, gameMode: nextMode };
+      })
     );
   }, [activeWorldId]);
 
-  const addItemToInventory = useCallback((itemId: AnyItemId, count: number) => {
-    const def = getItemDef(itemId);
-    const maxStack = def?.stackSize ?? 64;
-
-    setInventory((prev) => {
-      const next = prev.map((s) => (s ? { ...s } : null));
-      let remaining = count;
-
-      // 1. Merge into existing stacks
-      for (let i = 0; i < next.length && remaining > 0; i++) {
-        const slot = next[i];
-        if (slot && slot.itemId === itemId && slot.count < maxStack) {
-          const add = Math.min(remaining, maxStack - slot.count);
-          slot.count += add;
-          remaining -= add;
-        }
-      }
-
-      // 2. Fill empty slots (hotbar first)
-      for (let i = 0; i < next.length && remaining > 0; i++) {
-        if (!next[i]) {
-          const add = Math.min(remaining, maxStack);
-          next[i] = {
-            itemId,
-            count: add,
-            durability: def?.maxDurability,
-          };
-          remaining -= add;
-        }
-      }
-
-      return next;
-    });
+  const addXp = useCallback((amount: number) => {
+    if (amount <= 0) return;
+    setXp((prev) => prev + amount);
   }, []);
+
+  const markPlayerHurt = useCallback(() => {
+    setLastHurtAt(Date.now());
+  }, []);
+
+  const addItemToInventory = useCallback(
+    (itemId: AnyItemId, count: number, durability?: number) => {
+      const def = getItemDef(itemId);
+      const maxStack = def?.stackSize ?? 64;
+
+      setInventory((prev) => {
+        const next = prev.map((s) => (s ? { ...s } : null));
+        let remaining = count;
+
+        if (maxStack > 1) {
+          for (let i = 0; i < next.length && remaining > 0; i++) {
+            const slot = next[i];
+            if (slot && slot.itemId === itemId && slot.count < maxStack) {
+              const add = Math.min(remaining, maxStack - slot.count);
+              slot.count += add;
+              remaining -= add;
+            }
+          }
+        }
+
+        for (let i = 0; i < next.length && remaining > 0; i++) {
+          if (!next[i]) {
+            const add = Math.min(remaining, maxStack);
+            next[i] = {
+              itemId,
+              count: add,
+              durability: durability ?? def?.maxDurability,
+            };
+            remaining -= add;
+          }
+        }
+
+        return next;
+      });
+    },
+    []
+  );
 
   const consumeSelectedHotbarItem = useCallback(() => {
     if (activeWorld?.gameMode === 'creative') return;
@@ -419,9 +587,13 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         openSettings,
         worlds,
         activeWorld,
+        activeDimension,
+        preloadedChunksRef,
         launchWorld,
         createWorld,
         deleteWorld,
+        switchDimension,
+        saveWorldProgress,
         saveAndQuitWorld,
         settings,
         updateSettings,
@@ -433,11 +605,17 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setHealth,
         hunger,
         setHunger,
+        xp,
+        addXp,
+        lastHurtAt,
+        markPlayerHurt,
         addItemToInventory,
         consumeSelectedHotbarItem,
         damageHeldTool,
         craftingTableOpen,
         setCraftingTableOpen,
+        furnaceOpen,
+        setFurnaceOpen,
         telemetry,
         setTelemetry,
         targetHit,
